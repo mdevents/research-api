@@ -19,6 +19,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class NormalizeSlashesMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        scope = request.scope
+        path = scope.get("path", "")
+        while '//' in path:
+            path = path.replace('//', '/')
+        scope['path'] = path
+        request._scope = scope
+        return await call_next(request)
+
 def get_client() -> Client:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase env vars fehlen")

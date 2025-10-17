@@ -14,7 +14,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")  # For writes consider Service Rol
 SERVER_API_KEY = os.getenv("API_KEY")          # Expect as X-API-Key
 
 # ------------------ APP ------------------
-app = FastAPI(title="Research DB API", version="1.4.0")
+app = FastAPI(title="Research DB API", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,7 +63,7 @@ def health():
         "has_SUPABASE_URL": bool(SUPABASE_URL),
         "has_SUPABASE_ANON_KEY": bool(SUPABASE_KEY),
         "requires_api_key": bool(SERVER_API_KEY),
-        "version": "1.4.0"
+        "version": "1.5.0"
     }
 
 # ------------------ STUDIES (READ) ------------------
@@ -86,21 +86,28 @@ def list_studies(
     # duration filters
     duration_weeks_gte: Optional[float] = Query(None),
     duration_weeks_lte: Optional[float] = Query(None),
+    # effect filters (optional)
+    hr_gte: Optional[float] = Query(None, description="hazard_ratio >= value"),
+    hr_lte: Optional[float] = Query(None, description="hazard_ratio <= value"),
+    p_lte: Optional[float] = Query(None, description="p_value <= value"),
     # sorting & limit
-    order: Optional[str] = Query(None, description="e.g. year.desc, created_at.desc, study_design.asc"),
+    order: Optional[str] = Query(None, description="e.g. year.desc, created_at.desc, study_design.asc, hazard_ratio.asc"),
     limit: int = Query(200, ge=1, le=2000),
     _=Depends(auth),
 ):
     """
-    Returns rows from public.studies with full current schema:
+    Returns rows from public.studies with full schema:
       id, doi, pmid, year, study_design, n_participants, title, journal, abstract,
       outcomes (text[]), tags (text[]), source_url, population, intervention (jsonb),
-      comparison_group, duration_weeks, author, created_at, updated_at.
+      comparison_group, duration_weeks, author,
+      hazard_ratio, ci_low, ci_high, p_value,
+      created_at, updated_at.
     """
     sb = get_client()
     q = sb.table("studies").select(
         "id,doi,pmid,year,study_design,n_participants,title,journal,abstract,"
         "outcomes,tags,source_url,population,intervention,comparison_group,duration_weeks,author,"
+        "hazard_ratio,ci_low,ci_high,p_value,"
         "created_at,updated_at"
     )
 
@@ -139,6 +146,14 @@ def list_studies(
         q = q.gte("duration_weeks", duration_weeks_gte)
     if duration_weeks_lte is not None:
         q = q.lte("duration_weeks", duration_weeks_lte)
+
+    # effects
+    if hr_gte is not None:
+        q = q.gte("hazard_ratio", hr_gte)
+    if hr_lte is not None:
+        q = q.lte("hazard_ratio", hr_lte)
+    if p_lte is not None:
+        q = q.lte("p_value", p_lte)
 
     # order (map legacy 'design' -> 'study_design')
     if order:

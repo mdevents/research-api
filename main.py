@@ -1,6 +1,5 @@
-# main.py
 import os
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Depends, Query, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -11,11 +10,11 @@ from dotenv import load_dotenv
 # ------------------ ENV ------------------
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")  # für Reads reicht anon; für Writes ggf. Service Role nutzen
-SERVER_API_KEY = os.getenv("API_KEY")          # eigener Proxy-Key, wird als X-API-Key erwartet
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")  # Für Writes ggf. Service Role Key verwenden
+SERVER_API_KEY = os.getenv("API_KEY")          # Dein Proxy-Schlüssel, wird als X-API-Key erwartet
 
 # ------------------ APP ------------------
-app = FastAPI(title="Research DB API", version="1.2.0")
+app = FastAPI(title="Research DB API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,8 +39,10 @@ app.add_middleware(NormalizeSlashesMiddleware)
 # ------------------ UTILS ------------------
 def require_env():
     missing = []
-    if not SUPABASE_URL: missing.append("SUPABASE_URL")
-    if not SUPABASE_KEY: missing.append("SUPABASE_ANON_KEY")
+    if not SUPABASE_URL:
+        missing.append("SUPABASE_URL")
+    if not SUPABASE_KEY:
+        missing.append("SUPABASE_ANON_KEY")
     if missing:
         raise HTTPException(status_code=500, detail={"error": "Missing environment variables", "missing": missing})
 
@@ -50,7 +51,7 @@ def get_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def auth(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    # Wenn du ohne API-Key testen willst: Zeile darunter temporär auskommentieren.
+    # Wenn du offen testen willst, setze SERVER_API_KEY leer oder kommentiere die Prüfung aus
     if SERVER_API_KEY and x_api_key != SERVER_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return True
@@ -63,7 +64,7 @@ def health():
         "has_SUPABASE_URL": bool(SUPABASE_URL),
         "has_SUPABASE_ANON_KEY": bool(SUPABASE_KEY),
         "requires_api_key": bool(SERVER_API_KEY),
-        "version": "1.2.0"
+        "version": "1.3.0"
     }
 
 # ------------------ STUDIES (READ) ------------------
@@ -81,14 +82,14 @@ def list_studies(
     tag: Optional[str] = Query(None, description="Element in tags[]"),
     outcome: Optional[str] = Query(None, description="Element in outcomes[]"),
     # Sortierung & Limit
-    order: Optional[str] = Query(None, description="z. B. year.desc oder created_at.desc"),
+    order: Optional[str] = Query(None, description="z. B. year.desc, created_at.desc, study_design.asc"),
     limit: int = Query(200, ge=1, le=2000),
     _=Depends(auth),
 ):
     """
-    Liefert Studien aus public.studies gemäß deinem Schema:
-      - id, doi, pmid, year, study_design, n_participants, title, journal, abstract,
-        outcomes (text[]), tags (text[]), source_url, created_at, updated_at
+    Liefert Studien aus public.studies gemäß Schema:
+      id, doi, pmid, year, study_design, n_participants, title, journal, abstract,
+      outcomes (text[]), tags (text[]), source_url, created_at, updated_at
     WICHTIG: Spalte heißt 'study_design' (nicht 'design').
     """
     sb = get_client()
@@ -119,12 +120,14 @@ def list_studies(
     if outcome:
         q = q.contains("outcomes", [outcome])
 
-    # Order
+    # Order – mappe evtl. Alt-Aufrufe 'design' -> 'study_design'
     if order:
-        # Erwartet "col.dir", z. B. "year.desc"
         parts = order.split(".")
-        col = parts[0]
-        desc = len(parts) > 1 and parts[1].lower() == "desc"
+        col = parts[0].strip()
+        if col == "design":
+            col = "study_design"
+        direction = (parts[1].lower() if len(parts) > 1 else "asc")
+        desc = direction == "desc"
         q = q.order(col, desc=desc, nullsfirst=False)
 
     try:
@@ -134,35 +137,6 @@ def list_studies(
         detail = e.args[0] if e.args else {"message": "PostgREST error"}
         # typ. DB-Fehler (falsche Spalte etc.) → 400 an Client
         raise HTTPException(status_code=400, detail=detail)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ------------------ STUDIES MIN-VIEW (READ) ------------------
-@app.get("/studies_min")
-def list_studies_min(
-    order: Optional[str] = Query(None, description="z. B. year.desc"),
-    limit: int = Query(200, ge=1, le=2000),
-    _=Depends(auth),
-):
-    """
-    Optionaler Endpunkt für deine View public.studies_min.
-    """
-    sb = get_client()
-    q = sb.rpc("rpc_passthrough", {})  # Platzhalter, falls du später RPC brauchst
-
-    # Direkt auf View zugreifen:
-    q = get_client().table("studies_min").select("id,identifier,year,study_design,n_participants,title,journal,tags,outcomes")
-    if order:
-        parts = order.split(".")
-        col = parts[0]
-        desc = len(parts) > 1 and parts[1].lower() == "desc"
-        q = q.order(col, desc=desc, nullsfirst=False)
-
-    try:
-        res = q.limit(limit).execute()
-        return res.data or []
-    except APIError as e:
-        raise HTTPException(status_code=400, detail=e.args[0] if e.args else "PostgREST error")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -177,7 +151,7 @@ def upsert_study(
     Upsert EINER Studie. Nutzt Prefer 'merge-duplicates' + 'return=representation'.
     Achtung RLS: Für Writes ggf. Service-Role-Key setzen oder Policy erlauben.
     Auto-Handling:
-      - Falls 'design' im Payload vorkommt, wird es nach 'study_design' gemappt.
+      - Falls 'design' im Payload vorkommt, wird es nach 'study_design' gemappt (Abwärtskompatibilität).
       - Wenn 'on_conflict' nicht gesetzt ist:
           -> wenn doi vorhanden: on_conflict='doi'
           -> sonst, wenn pmid vorhanden: on_conflict='pmid'
@@ -192,11 +166,11 @@ def upsert_study(
     # Automatische Konfliktspalte bestimmen
     conflict_col = on_conflict
     if not conflict_col:
-        doi = (study.get("doi") or "") if isinstance(study.get("doi"), str) else study.get("doi")
-        pmid = (study.get("pmid") or "") if isinstance(study.get("pmid"), str) else study.get("pmid")
-        if doi:
+        doi_val = study.get("doi")
+        pmid_val = study.get("pmid")
+        if doi_val:
             conflict_col = "doi"
-        elif pmid:
+        elif pmid_val:
             conflict_col = "pmid"
         else:
             raise HTTPException(status_code=400, detail="Upsert erfordert mindestens doi oder pmid (siehe DB-Constraint).")
@@ -215,6 +189,3 @@ def upsert_study(
         raise HTTPException(status_code=400, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# ------------------ OPTIONALE LISTEN (falls du weitere Tabellen ergänzt) ------------------
-# Placeholder-Endpunkte, falls du später normalisierte Tags/Outcomes einführst.

@@ -10,11 +10,11 @@ from dotenv import load_dotenv
 # ------------------ ENV ------------------
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")  # For writes consider Service Role if RLS blocks
-SERVER_API_KEY = os.getenv("API_KEY")          # Expect as X-API-Key
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")  # consider service role for writes under RLS
+SERVER_API_KEY = os.getenv("API_KEY")          # provided as X-API-Key
 
 # ------------------ APP ------------------
-app = FastAPI(title="Research DB API", version="1.5.0")
+app = FastAPI(title="Research DB API", version="1.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,9 +28,9 @@ class NormalizeSlashesMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         scope = request.scope
         path = scope.get("path", "")
-        while '//' in path:
-            path = path.replace('//', '/')
-        scope['path'] = path
+        while "//" in path:
+            path = path.replace("//", "/")
+        scope["path"] = path
         request._scope = scope
         return await call_next(request)
 
@@ -63,7 +63,7 @@ def health():
         "has_SUPABASE_URL": bool(SUPABASE_URL),
         "has_SUPABASE_ANON_KEY": bool(SUPABASE_KEY),
         "requires_api_key": bool(SERVER_API_KEY),
-        "version": "1.5.0"
+        "version": "1.6.0"
     }
 
 # ------------------ STUDIES (READ) ------------------
@@ -74,6 +74,7 @@ def list_studies(
     author: Optional[str] = Query(None, description="ILIKE on author"),
     population: Optional[str] = Query(None, description="ILIKE on population"),
     comparison_group: Optional[str] = Query(None, description="ILIKE on comparison_group"),
+    core_claim: Optional[str] = Query(None, description="ILIKE on core_claim"),
     # identifiers
     doi: Optional[str] = Query(None, description="exact DOI"),
     pmid: Optional[str] = Query(None, description="exact PMID"),
@@ -86,38 +87,37 @@ def list_studies(
     # duration filters
     duration_weeks_gte: Optional[float] = Query(None),
     duration_weeks_lte: Optional[float] = Query(None),
-    # effect filters (optional)
+    # effect filters
     hr_gte: Optional[float] = Query(None, description="hazard_ratio >= value"),
     hr_lte: Optional[float] = Query(None, description="hazard_ratio <= value"),
     p_lte: Optional[float] = Query(None, description="p_value <= value"),
+    # evidence filter
+    evidence_grade: Optional[str] = Query(None, description="one of: high, moderate, low"),
     # sorting & limit
-    order: Optional[str] = Query(None, description="e.g. year.desc, created_at.desc, study_design.asc, hazard_ratio.asc"),
+    order: Optional[str] = Query(None, description="e.g. year.desc, evidence_grade.asc, hazard_ratio.asc"),
     limit: int = Query(200, ge=1, le=2000),
     _=Depends(auth),
 ):
     """
-    Returns rows from public.studies with full schema:
-      id, doi, pmid, year, study_design, n_participants, title, journal, abstract,
-      outcomes (text[]), tags (text[]), source_url, population, intervention (jsonb),
-      comparison_group, duration_weeks, author,
-      hazard_ratio, ci_low, ci_high, p_value,
-      created_at, updated_at.
+    Returns rows from public.studies including labels:
+      core_claim, evidence_grade.
     """
     sb = get_client()
     q = sb.table("studies").select(
         "id,doi,pmid,year,study_design,n_participants,title,journal,abstract,"
         "outcomes,tags,source_url,population,intervention,comparison_group,duration_weeks,author,"
         "hazard_ratio,ci_low,ci_high,p_value,"
+        "core_claim,evidence_grade,"
         "created_at,updated_at"
     )
 
-    # identifiers
+    # exact ids
     if doi:
         q = q.eq("doi", doi)
     if pmid:
         q = q.eq("pmid", pmid)
 
-    # ILIKE helpers
+    # ILIKE helper
     def ilike(qb, col, val):
         if not val:
             return qb
@@ -128,6 +128,7 @@ def list_studies(
     q = ilike(q, "author", author)
     q = ilike(q, "population", population)
     q = ilike(q, "comparison_group", comparison_group)
+    q = ilike(q, "core_claim", core_claim)
 
     # years
     if year_gte is not None:
@@ -155,7 +156,14 @@ def list_studies(
     if p_lte is not None:
         q = q.lte("p_value", p_lte)
 
-    # order (map legacy 'design' -> 'study_design')
+    # evidence
+    if evidence_grade:
+        eg = evidence_grade.strip().lower()
+        if eg not in {"high", "moderate", "low"}:
+            raise HTTPException(status_code=400, detail="evidence_grade must be one of: high, moderate, low")
+        q = q.eq("evidence_grade", eg)
+
+    # ordering
     if order:
         parts = order.split(".")
         col = parts[0].strip()
@@ -177,13 +185,13 @@ def list_studies(
 # ------------------ STUDIES (UPSERT ONE) ------------------
 @app.post("/studies")
 def upsert_study(
-    study: Dict[str, Any] = Body(..., description="One study row (JSON)"),
+    study: Dict[str, Any] = Body(...),
     on_conflict: Optional[str] = Query(None, description="Conflict column: 'doi' or 'pmid'. Auto if omitted."),
     _=Depends(auth),
 ):
     """
-    Upsert ONE study into public.studies. Respects your check constraint (needs doi or pmid).
-    Auto-maps legacy 'design' -> 'study_design'.
+    Upsert one study into public.studies.
+    Also supports legacy 'design' -> 'study_design'.
     """
     sb = get_client()
 
@@ -191,7 +199,15 @@ def upsert_study(
     if "design" in study and "study_design" not in study:
         study["study_design"] = study.pop("design")
 
-    # decide conflict column
+    # normalize evidence_grade
+    if "evidence_grade" in study and isinstance(study["evidence_grade"], str):
+        eg = study["evidence_grade"].strip().lower()
+        if eg in {"high","moderate","low"}:
+            study["evidence_grade"] = eg
+        else:
+            study["evidence_grade"] = None
+
+    # conflict column
     conflict_col = on_conflict
     if not conflict_col:
         if study.get("doi"):

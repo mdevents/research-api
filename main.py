@@ -10,11 +10,11 @@ from dotenv import load_dotenv
 # ------------------ ENV ------------------
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")  # Für Writes ggf. Service Role Key verwenden
-SERVER_API_KEY = os.getenv("API_KEY")          # Dein Proxy-Schlüssel, wird als X-API-Key erwartet
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")  # For writes consider Service Role if RLS blocks
+SERVER_API_KEY = os.getenv("API_KEY")          # Expect as X-API-Key
 
 # ------------------ APP ------------------
-app = FastAPI(title="Research DB API", version="1.3.0")
+app = FastAPI(title="Research DB API", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,7 +51,6 @@ def get_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def auth(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    # Wenn du offen testen willst, setze SERVER_API_KEY leer oder kommentiere die Prüfung aus
     if SERVER_API_KEY and x_api_key != SERVER_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return True
@@ -64,63 +63,84 @@ def health():
         "has_SUPABASE_URL": bool(SUPABASE_URL),
         "has_SUPABASE_ANON_KEY": bool(SUPABASE_KEY),
         "requires_api_key": bool(SERVER_API_KEY),
-        "version": "1.3.0"
+        "version": "1.4.0"
     }
 
 # ------------------ STUDIES (READ) ------------------
 @app.get("/studies")
 def list_studies(
-    # Freitext im Titel via ILIKE
-    title: Optional[str] = Query(None, description="Case-insensitive Suche im Titel (ILIKE). Beispiel: magnesium"),
-    # exakte Identifier
-    doi: Optional[str] = Query(None, description="Exakter DOI-Match"),
-    pmid: Optional[str] = Query(None, description="Exakter PMID-Match"),
-    # Jahr-Filter
-    year_gte: Optional[int] = Query(None, description="z. B. 2015"),
-    year_lte: Optional[int] = Query(None, description="z. B. 2025"),
-    # Array-Contains Filter
-    tag: Optional[str] = Query(None, description="Element in tags[]"),
-    outcome: Optional[str] = Query(None, description="Element in outcomes[]"),
-    # Sortierung & Limit
-    order: Optional[str] = Query(None, description="z. B. year.desc, created_at.desc, study_design.asc"),
+    # text search
+    title: Optional[str] = Query(None, description="ILIKE on title"),
+    author: Optional[str] = Query(None, description="ILIKE on author"),
+    population: Optional[str] = Query(None, description="ILIKE on population"),
+    comparison_group: Optional[str] = Query(None, description="ILIKE on comparison_group"),
+    # identifiers
+    doi: Optional[str] = Query(None, description="exact DOI"),
+    pmid: Optional[str] = Query(None, description="exact PMID"),
+    # years
+    year_gte: Optional[int] = Query(None),
+    year_lte: Optional[int] = Query(None),
+    # arrays
+    tag: Optional[str] = Query(None, description="element in tags[]"),
+    outcome: Optional[str] = Query(None, description="element in outcomes[]"),
+    # duration filters
+    duration_weeks_gte: Optional[float] = Query(None),
+    duration_weeks_lte: Optional[float] = Query(None),
+    # sorting & limit
+    order: Optional[str] = Query(None, description="e.g. year.desc, created_at.desc, study_design.asc"),
     limit: int = Query(200, ge=1, le=2000),
     _=Depends(auth),
 ):
     """
-    Liefert Studien aus public.studies gemäß Schema:
+    Returns rows from public.studies with full current schema:
       id, doi, pmid, year, study_design, n_participants, title, journal, abstract,
-      outcomes (text[]), tags (text[]), source_url, created_at, updated_at
-    WICHTIG: Spalte heißt 'study_design' (nicht 'design').
+      outcomes (text[]), tags (text[]), source_url, population, intervention (jsonb),
+      comparison_group, duration_weeks, author, created_at, updated_at.
     """
     sb = get_client()
     q = sb.table("studies").select(
-        "id,doi,pmid,year,study_design,n_participants,title,journal,abstract,outcomes,tags,source_url,created_at,updated_at"
+        "id,doi,pmid,year,study_design,n_participants,title,journal,abstract,"
+        "outcomes,tags,source_url,population,intervention,comparison_group,duration_weeks,author,"
+        "created_at,updated_at"
     )
 
-    # Identifier-Filter
+    # identifiers
     if doi:
         q = q.eq("doi", doi)
     if pmid:
         q = q.eq("pmid", pmid)
 
-    # Titel ILIKE
-    if title:
-        pattern = title if ("%" in title or "_" in title) else f"%{title}%"
-        q = q.ilike("title", pattern)
+    # ILIKE helpers
+    def ilike(qb, col, val):
+        if not val:
+            return qb
+        pattern = val if ("%" in val or "_" in val) else f"%{val}%"
+        return qb.ilike(col, pattern)
 
-    # Jahrbereich
+    q = ilike(q, "title", title)
+    q = ilike(q, "author", author)
+    q = ilike(q, "population", population)
+    q = ilike(q, "comparison_group", comparison_group)
+
+    # years
     if year_gte is not None:
         q = q.gte("year", year_gte)
     if year_lte is not None:
         q = q.lte("year", year_lte)
 
-    # Arrays: contains
+    # arrays
     if tag:
         q = q.contains("tags", [tag])
     if outcome:
         q = q.contains("outcomes", [outcome])
 
-    # Order – mappe evtl. Alt-Aufrufe 'design' -> 'study_design'
+    # duration
+    if duration_weeks_gte is not None:
+        q = q.gte("duration_weeks", duration_weeks_gte)
+    if duration_weeks_lte is not None:
+        q = q.lte("duration_weeks", duration_weeks_lte)
+
+    # order (map legacy 'design' -> 'study_design')
     if order:
         parts = order.split(".")
         col = parts[0].strip()
@@ -135,7 +155,6 @@ def list_studies(
         return res.data or []
     except APIError as e:
         detail = e.args[0] if e.args else {"message": "PostgREST error"}
-        # typ. DB-Fehler (falsche Spalte etc.) → 400 an Client
         raise HTTPException(status_code=400, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -143,37 +162,29 @@ def list_studies(
 # ------------------ STUDIES (UPSERT ONE) ------------------
 @app.post("/studies")
 def upsert_study(
-    study: Dict[str, Any] = Body(..., description="Eine Studien-Zeile im JSON-Format"),
-    on_conflict: Optional[str] = Query(None, description="Konfliktspalte: 'doi' oder 'pmid'. Wenn leer, wird automatisch gewählt."),
+    study: Dict[str, Any] = Body(..., description="One study row (JSON)"),
+    on_conflict: Optional[str] = Query(None, description="Conflict column: 'doi' or 'pmid'. Auto if omitted."),
     _=Depends(auth),
 ):
     """
-    Upsert EINER Studie. Nutzt Prefer 'merge-duplicates' + 'return=representation'.
-    Achtung RLS: Für Writes ggf. Service-Role-Key setzen oder Policy erlauben.
-    Auto-Handling:
-      - Falls 'design' im Payload vorkommt, wird es nach 'study_design' gemappt (Abwärtskompatibilität).
-      - Wenn 'on_conflict' nicht gesetzt ist:
-          -> wenn doi vorhanden: on_conflict='doi'
-          -> sonst, wenn pmid vorhanden: on_conflict='pmid'
-          -> sonst Fehler (mind. doi oder pmid muss existieren; siehe DB-Check-Constraint)
+    Upsert ONE study into public.studies. Respects your check constraint (needs doi or pmid).
+    Auto-maps legacy 'design' -> 'study_design'.
     """
     sb = get_client()
 
-    # Legacy-Mapping: design -> study_design
+    # legacy mapping
     if "design" in study and "study_design" not in study:
         study["study_design"] = study.pop("design")
 
-    # Automatische Konfliktspalte bestimmen
+    # decide conflict column
     conflict_col = on_conflict
     if not conflict_col:
-        doi_val = study.get("doi")
-        pmid_val = study.get("pmid")
-        if doi_val:
+        if study.get("doi"):
             conflict_col = "doi"
-        elif pmid_val:
+        elif study.get("pmid"):
             conflict_col = "pmid"
         else:
-            raise HTTPException(status_code=400, detail="Upsert erfordert mindestens doi oder pmid (siehe DB-Constraint).")
+            raise HTTPException(status_code=400, detail="Upsert requires at least doi or pmid.")
 
     try:
         res = sb.table("studies").upsert(
@@ -185,7 +196,6 @@ def upsert_study(
         return res.data or []
     except APIError as e:
         detail = e.args[0] if e.args else {"message": "PostgREST error"}
-        # 401/403 → meist RLS/Key-Problem
         raise HTTPException(status_code=400, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
